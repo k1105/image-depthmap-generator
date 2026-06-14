@@ -1,0 +1,1541 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Image → 3D Viewer (Depth Anything)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0b0d12; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; }
+
+  #drop {
+    position: fixed; inset: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: center;
+    pointer-events: none; opacity: 0; transition: opacity .15s ease;
+    background: rgba(11,13,18,.72); backdrop-filter: blur(2px);
+  }
+  #drop.active { opacity: 1; }
+  #drop .box { border: 2px dashed #6aa9ff; border-radius: 16px; padding: 48px 64px; color: #cfe1ff; font-size: 18px; }
+
+  #hint {
+    position: fixed; z-index: 10; left: 50%; top: 50%;
+    transform: translate(-50%, -50%); text-align: center;
+    color: #8b97ad; pointer-events: none; user-select: none; transition: opacity .3s ease;
+  }
+  #hint h1 { font-size: 22px; font-weight: 600; color: #e6ecf7; margin-bottom: 10px; }
+  #hint p { font-size: 14px; line-height: 1.7; }
+  #hint .key { color: #6aa9ff; }
+  #hint.hidden { opacity: 0; }
+
+  #bar { position: fixed; z-index: 12; left: 14px; top: 14px; display: flex; gap: 8px; align-items: center; }
+  .btn {
+    pointer-events: auto; cursor: pointer; border: 1px solid #2a3142;
+    background: #161b26; color: #d7deea; font-size: 13px; padding: 8px 14px; border-radius: 9px;
+    transition: background .12s, border-color .12s;
+  }
+  .btn:hover { background: #1d2433; border-color: #3a435a; }
+  #status {
+    pointer-events: none; font-size: 12px; color: #7f8aa0;
+    background: rgba(22,27,38,.85); padding: 6px 10px; border-radius: 7px;
+    max-width: 46vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  /* Progress bar (model download / inference) */
+  #progress {
+    position: fixed; z-index: 30; left: 50%; bottom: 26px; transform: translateX(-50%);
+    width: min(420px, 70vw); display: none;
+  }
+  #progress.show { display: block; }
+  #progress .label { font-size: 12px; color: #aeb8cc; margin-bottom: 6px; text-align: center; }
+  #progress .track { height: 6px; background: #1a2030; border-radius: 4px; overflow: hidden; }
+  #progress .fill { height: 100%; width: 0%; background: linear-gradient(90deg,#4a82e0,#6aa9ff); transition: width .15s ease; }
+
+  input[type=file] { display: none; }
+
+  /* Step 1 standby: show just the loaded/generated image, centered, while the
+     depth + mask pipeline runs in the background. Hidden once the 3D is ready. */
+  #preview {
+    position: fixed; z-index: 11; left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+    max-width: 86vw; max-height: 86vh; object-fit: contain;
+    border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,.5);
+    display: none; pointer-events: none;
+  }
+  #preview.show { display: block; }
+
+  /* Camera capture panel (写真から生成) */
+  #camPanel {
+    position: fixed; z-index: 13; left: 14px; top: 58px; width: 320px;
+    background: rgba(22,27,38,.96); border: 1px solid #2a3142; border-radius: 11px;
+    padding: 12px; display: flex; flex-direction: column; gap: 10px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.45);
+  }
+  #camPanel.hidden { display: none; }
+  #camPanel video, #camPanel #camPhoto {
+    width: 100%; aspect-ratio: 4 / 3; object-fit: cover;
+    background: #000; border-radius: 8px;
+  }
+  /* In album mode the picked photo replaces the live camera feed. */
+  #camPanel #camPhoto { display: none; }
+  #camPanel.album #camPhoto { display: block; }
+  #camPanel.album video { display: none; }
+  #camPanel textarea {
+    width: 100%; height: 128px; resize: vertical; font-family: inherit;
+    background: #0f131c; color: #d7deea; border: 1px solid #2a3142;
+    border-radius: 8px; padding: 8px; font-size: 12px; line-height: 1.5;
+  }
+  #camPanel .cam-actions { display: flex; gap: 8px; }
+  #camPanel .cam-actions .btn { flex: 1; text-align: center; }
+</style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <img id="preview" alt="" />
+
+
+  <div id="bar">
+    <button class="btn" id="camera">📷 写真から生成</button>
+    <button class="btn" id="open">📂 画像を開く</button>
+    <button class="btn" id="reset">視点リセット</button>
+    <button class="btn" id="apikey">🔑 APIキー</button>
+    <div id="status">起動中…</div>
+  </div>
+
+  <div id="hint">
+    <h1>Image → 3D Viewer</h1>
+    <p>
+      写真・イラストを <span class="key">ドラッグ＆ドロップ</span> または <span class="key">「画像を開く」</span><br />
+      AI（Depth Anything V2）が深度を推定して立体化します<br />
+      ドラッグで回転 / ホイールでズーム / 右ドラッグで移動
+    </p>
+  </div>
+
+  <div id="camPanel" class="hidden">
+    <video id="camVideo" autoplay playsinline muted></video>
+    <img id="camPhoto" alt="" />
+    <textarea id="camPrompt" placeholder="生成プロンプト"></textarea>
+    <div class="cam-actions">
+      <button class="btn" id="camGenerate">✨ 生成</button>
+      <button class="btn" id="camAlbum">🖼 アルバム</button>
+      <button class="btn" id="camClose">閉じる</button>
+    </div>
+    <input type="file" id="camFile" accept="image/*" />
+  </div>
+
+  <div id="drop"><div class="box">ここにドロップ</div></div>
+
+  <div id="progress"><div class="label"></div><div class="track"><div class="fill"></div></div></div>
+
+  <input type="file" id="file" accept="image/*" />
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.184.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.184.0/examples/jsm/",
+    "lil-gui": "https://unpkg.com/lil-gui@0.21.0/dist/lil-gui.esm.js",
+    "@huggingface/transformers": "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/dist/transformers.min.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import GUI from 'lil-gui';
+import { pipeline, env } from '@huggingface/transformers';
+
+// Only fetch models from the Hugging Face Hub (no local lookups).
+env.allowLocalModels = false;
+
+// ---------------------------------------------------------------------------
+// Scene
+// ---------------------------------------------------------------------------
+const appEl = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x0b0d12, 1);
+appEl.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.01, 100);
+camera.position.set(0, 0, 2.4);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+
+// Lights tuned so surface relief reads clearly even on an untextured mesh:
+// modest ambient + a strong raking key light from upper-left + a cool fill.
+const ambient = new THREE.AmbientLight(0xffffff, 0.45);
+scene.add(ambient);
+const keyLight = new THREE.DirectionalLight(0xffffff, 1.6);
+keyLight.position.set(-1.2, 1.6, 1.4);
+scene.add(keyLight);
+const fillLight = new THREE.DirectionalLight(0x9fb6ff, 0.5);
+fillLight.position.set(1.5, -0.8, 1.0);
+scene.add(fillLight);
+
+// ---------------------------------------------------------------------------
+// Mesh — a subdivided plane whose vertices are displaced by the depth map.
+// We displace on the CPU (not via material.displacementMap) so that
+// computeVertexNormals() can rebuild correct normals — otherwise lighting
+// stays flat and the relief is invisible without a texture.
+// ---------------------------------------------------------------------------
+let mesh = null, geometry = null;
+let colorTexture = null, alphaTexture = null;
+let depthData = null, depthW = 0, depthH = 0; // latest depth map (grayscale)
+let depthVersion = 0;                          // bumped each time a new depth map loads
+let alphaData = null, alphaW = 0, alphaH = 0; // latest alpha map (0=cut, 255=keep)
+let alphaVersion = 0;                          // bumped each time a new mask loads
+// Carve masks (目 / アウトライン …) are kept in `carveMasks` below — each holds
+// its own grayscale buffer + params and is processed identically.
+let currentImage = null;                      // the loaded source image element
+let imageAspect = 1;
+
+const material = new THREE.MeshStandardMaterial({
+  color: 0xffffff, roughness: 0.85, metalness: 0.0, side: THREE.DoubleSide,
+  flatShading: false,
+});
+
+const params = {
+  model: 'small',       // Depth Anything V2 size: small / base / large
+  depthScale: 0.45,
+  segments: 512,
+  showTexture: false,   // map the original photo onto the surface
+  invertDepth: false,   // flip near/far if it pops the wrong way
+  wireframe: false,
+  autoRotate: false,
+  useAlpha: true,       // mask via a Nano Banana alpha map
+  alphaThreshold: 0.5,  // below this the area is cut out (no depth, hidden)
+  edgeCut: 0.04,        // width (fraction) of the band where depth ramps to 0
+                        // at the silhouette, faking a clean cross-section cut
+  smooth: 3.8,          // depth-map blur radius (px). The depth map is 8-bit
+                        // (256 levels), so without this the relief shows
+                        // staircase "terraces". Blurring into float dissolves
+                        // the quantization. 0 = off (raw, terraced).
+  // STL mold export (a solid cuboid with the relief carved into the top).
+  // Bump amplitude (凹凸感) is shared with the depthScale slider; the offset is
+  // a separate flat recess down to the "depth 0" plane (the cross-section wall).
+  // castType: 'cavity' carves the relief INTO the top (negative mold, original
+  // behaviour); 'positive' raises the relief OUT of a flat base plate so the
+  // actual form is printed instead of its mold.
+  castType: 'cavity',
+  offsetMM: 2,          // flat recess depth at the silhouette (down to depth 0)
+  marginMM: 3,          // floor thickness left under the deepest point
+  boxWidthMM: 80,       // footprint width (X) in mm; height (Y) follows aspect
+  boxAspect: 0,         // cuboid footprint W/H; 0 = follow the image aspect
+  exportRes: 512,       // STL grid resolution along the long axis
+  previewMold: false,   // show the carved mold solid instead of the relief
+  // Mold footprint shape: 'box' = full rectangular cuboid (default), or
+  // 'outline' = follow the alpha silhouette, expanded outward by outlineMM,
+  // and cut away everything outside that offset contour.
+  moldShape: 'box',
+  outlineMM: 5,         // outward offset width (mm) of the silhouette frame
+  showDims: true,       // overlay W×H×Z dimension lines + billboard labels on
+                        // the mold preview, measured from the ACTUAL mesh bbox
+                        // (so 'outline' mode shows its real, smaller footprint)
+  // Optional base cuboid welded under the model (z<0), merged into one solid so
+  // the export is a single printable model sitting on a pedestal/plate.
+  addBase: false,
+  baseWidthMM: 80,      // base footprint width (X)
+  baseHeightMM: 80,     // base footprint height (Y)
+  baseThickMM: 5,       // base thickness (Z, extends downward from z=0)
+};
+const MOLD_PREVIEW_FIT = 1.8 / 80;        // mm -> preview units (fixed, size-honest)
+const MOLD_MM_PER_UNIT = 1 / MOLD_PREVIEW_FIT;  // relief world-units -> mm; chosen so the
+                                          // mold preview shows the SAME bump heights as the
+                                          // relief preview (depthScale behaves identically)
+
+// Nano Banana (Gemini image model) — generates the alpha map for masking.
+const NB_MODEL = 'gemini-3.1-flash-image';
+const NB_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models';
+const NB_PROMPT = 'この画像のアルファマップを生成して';
+const getApiKey = () => localStorage.getItem('gemini_api_key') || '';
+
+// Default prompt for 写真から生成 — turns the camera photo into a chibi designer toy.
+const DEFAULT_GEN_PROMPT = `A commercial product photograph of an ultra-cute, 3DCG designer toy. It is conceptualized as a playful, comical chibi character inspired by the person in the photo.
+
+[Proportions & Adorable Silhouette]
+
+Style: Super-deformed 2-head scale (large, adorable head with a small, plump, chunky body).
+
+Form: Smooth, rounded, and friendly silhouette with a low center of gravity. It should look like a cuddly, solid vinyl collectible.
+
+Parts: No negative spaces or gaps. The cute arms and hands are snugly pressed against the body to create a single, continuous, highly stable shape.
+
+[Playful Details & Depth]
+
+Facial Features: Charming and expressive 3D facial contours. Plump rounded cheeks, a softly raised cute nose, and distinct features that provide a rich three-dimensional depth (not flat).
+
+Outfit: The outfit is simplified into a cute, chunky design. There is a clear, simple groove defining the boundary between the top and the pants, maintaining a stylized look.
+
+[Color & Composition]
+
+Color Palette: Commercial Pop style. Extremely high saturation with vibrant, cheerful primary colors matching the original outfit.
+
+Framing: Full-body shot from head to toe, capturing the entire adorable figure.
+
+[Crucial Background Instructions]
+
+The background must be completely uniform, solid white.
+
+Crystal clear boundary between the subject and the background.
+
+No gradients, no shadows, and no lighting effects on the background.`;
+
+// ---------------------------------------------------------------------------
+// Carve masks — extra Nano Banana masks (besides the alpha map) that carve
+// their region deeper into the relief. Every mask is processed identically
+// (distance-ramped inward carve), so adding one is just a new prompt here.
+// ---------------------------------------------------------------------------
+const CARVE_MASK_THRESHOLD = 0.5;   // binarize the grayscale mask at this level
+function makeCarveMask(id, label, prompt, params = {}) {
+  return {
+    id, label, prompt,
+    data: null, w: 0, h: 0, version: 0,   // grayscale buffer (255 = carve here)
+    distCache: null, distCacheKey: '',     // inward distance transform cache
+    // invert: flip the mask polarity when the model returns the region to keep
+    // as black instead of white (so the wrong area would otherwise be carved).
+    params: { use: true, carve: 0.35, edge: 0.04, invert: false, ...params },
+  };
+}
+const carveMasks = [
+  makeCarveMask('eye', '目',
+    'この画像から、まつ毛と虹彩、または目のパーツの部分だけを残すマスク画像を生成してください。メガネのような顔の装飾要素は無視する。',
+    { carve: 0.24, edge: 0.035 }),
+  makeCarveMask('outline', 'アウトライン',
+    'この画像から、形状がわかりやすいように幅のあるストロークを抽出し、ストローク部分のみを残すマスク画像を生成してください。',
+    { carve: 0.47, edge: 0.06 }),
+];
+
+// ---------------------------------------------------------------------------
+// Result cache (localStorage). Depth maps and alpha maps are expensive to
+// regenerate (local inference / paid Gemini calls), so we key them by image
+// content and reuse them. Values are grayscale PNG data URLs — they compress
+// well, so many images fit. A small LRU index caps total size.
+// ---------------------------------------------------------------------------
+const CACHE_PREFIX = 'i3d:';
+const CACHE_INDEX_KEY = 'i3d:index';
+const CACHE_MAX_ENTRIES = 20;
+
+function cacheIndex() {
+  try { return JSON.parse(localStorage.getItem(CACHE_INDEX_KEY) || '[]'); }
+  catch { return []; }
+}
+function touchCache(key) {
+  const idx = cacheIndex().filter(k => k !== key);
+  idx.push(key); // most-recently-used at the end
+  while (idx.length > CACHE_MAX_ENTRIES) {
+    localStorage.removeItem(CACHE_PREFIX + idx.shift());
+  }
+  localStorage.setItem(CACHE_INDEX_KEY, JSON.stringify(idx));
+}
+function cacheGet(key) {
+  const v = localStorage.getItem(CACHE_PREFIX + key);
+  if (v != null) touchCache(key);
+  return v;
+}
+function cacheSet(key, value) {
+  try {
+    localStorage.setItem(CACHE_PREFIX + key, value);
+    touchCache(key);
+  } catch (e) {
+    // Likely quota exceeded: drop the oldest half and retry once.
+    const idx = cacheIndex();
+    const drop = idx.slice(0, Math.ceil(idx.length / 2));
+    drop.forEach(k => localStorage.removeItem(CACHE_PREFIX + k));
+    localStorage.setItem(CACHE_INDEX_KEY, JSON.stringify(idx.slice(drop.length)));
+    try { localStorage.setItem(CACHE_PREFIX + key, value); touchCache(key); }
+    catch { /* still too big; caching is best-effort */ }
+  }
+}
+
+// Stable content hash of an image (downscaled to 64×64, FNV-1a over pixels),
+// so the same picture maps to the same key regardless of its object URL.
+function hashImage(image) {
+  const s = 64;
+  const c = document.createElement('canvas'); c.width = s; c.height = s;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(image, 0, 0, s, s);
+  const d = ctx.getImageData(0, 0, s, s).data;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < d.length; i++) { h ^= d[i]; h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(16);
+}
+
+// Grayscale buffer <-> PNG data URL, for compact cache storage.
+function grayToPngDataUrl(buf, w, h) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d');
+  const id = ctx.createImageData(w, h);
+  for (let i = 0; i < w * h; i++) { id.data[i*4]=id.data[i*4+1]=id.data[i*4+2]=buf[i]; id.data[i*4+3]=255; }
+  ctx.putImageData(id, 0, 0);
+  return c.toDataURL('image/png');
+}
+async function grayFromPngDataUrl(url) {
+  const im = await loadImage(url);
+  const w = im.naturalWidth, h = im.naturalHeight;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(im, 0, 0);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  const buf = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) buf[i] = d[i*4];
+  return { buf, w, h };
+}
+
+// Approx download sizes (q8/fp32) — shown so the user knows the tradeoff.
+const MODEL_INFO = {
+  small: { id: 'onnx-community/depth-anything-v2-small', note: '小・高速 (~50MB)' },
+  base:  { id: 'onnx-community/depth-anything-v2-base',  note: '中 (~200MB)' },
+  large: { id: 'onnx-community/depth-anything-v2-large', note: '大・高品質 (~650MB)' },
+};
+let lastUrl = null, lastName = null;   // remember the current image for re-runs
+
+// Bilinear sample of a map at normalized uv (origin bottom-left). Image rows
+// are top-down, plane v is bottom-up -> flip v. Returns the raw interpolated
+// value (not divided by 255).
+function sampleRaw(data, mw, mh, u, v) {
+  const fx = u * (mw - 1);
+  const fy = (1 - v) * (mh - 1);
+  const x0 = Math.floor(fx), y0 = Math.floor(fy);
+  const x1 = Math.min(mw - 1, x0 + 1), y1 = Math.min(mh - 1, y0 + 1);
+  const tx = fx - x0, ty = fy - y0;
+  const d00 = data[y0 * mw + x0], d10 = data[y0 * mw + x1];
+  const d01 = data[y1 * mw + x0], d11 = data[y1 * mw + x1];
+  const a = d00 + (d10 - d00) * tx;
+  const b = d01 + (d11 - d01) * tx;
+  return a + (b - a) * ty;
+}
+const sampleMap = (data, mw, mh, u, v) => sampleRaw(data, mw, mh, u, v) / 255;
+
+// Separable box blur of a grayscale buffer into a Float32 buffer. Output keeps
+// fractional values, which is the point: it dissolves the depth map's 8-bit
+// (256-level) quantization that otherwise shows up as staircase terraces.
+// O(n) per pass via a running sum, so the radius is essentially free.
+function boxBlurGray(src, w, h, radius) {
+  const r = Math.max(1, Math.round(radius)), win = 2 * r + 1;
+  const clampX = (x) => x < 0 ? 0 : (x > w - 1 ? w - 1 : x);
+  const clampY = (y) => y < 0 ? 0 : (y > h - 1 ? h - 1 : y);
+  const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const row = y * w; let sum = 0;
+    for (let x = -r; x <= r; x++) sum += src[row + clampX(x)];
+    for (let x = 0; x < w; x++) {
+      tmp[row + x] = sum / win;
+      sum += src[row + clampX(x + r + 1)] - src[row + clampX(x - r)];
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let sum = 0;
+    for (let y = -r; y <= r; y++) sum += tmp[clampY(y) * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = sum / win;
+      sum += tmp[clampY(y + r + 1) * w + x] - tmp[clampY(y - r) * w + x];
+    }
+  }
+  return out;
+}
+
+// The depth buffer used for displacement: raw when smoothing is off, otherwise
+// a blurred float copy (cached per depth map + radius).
+let depthSmooth = null, depthSmoothKey = '';
+function getDepthField() {
+  if (!depthData || params.smooth <= 0) return depthData;
+  const key = `${depthVersion}@${params.smooth}`;
+  if (depthSmooth && depthSmoothKey === key) return depthSmooth;
+  depthSmooth = boxBlurGray(depthData, depthW, depthH, params.smooth);
+  depthSmoothKey = key;
+  return depthSmooth;
+}
+
+// Chamfer distance transform: for each kept pixel, distance (in px) to the
+// nearest cut-out pixel. Used to ramp depth down near the silhouette so the
+// edge looks like a flat cross-section cut. Cached per (mask, threshold).
+let distCache = null, distCacheKey = '';
+function getEdgeDistance() {
+  const key = `${alphaVersion}@${params.alphaThreshold}`;
+  if (distCache && distCacheKey === key) return distCache;
+  const w = alphaW, h = alphaH, n = w * h;
+  const t = params.alphaThreshold * 255;
+  const INF = 1e9, D1 = 1, D2 = Math.SQRT2;
+  const dist = new Float32Array(n);
+  for (let i = 0; i < n; i++) dist[i] = alphaData[i] >= t ? INF : 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x; if (dist[i] === 0) continue;
+    let m = dist[i];
+    if (x > 0) m = Math.min(m, dist[i - 1] + D1);
+    if (y > 0) m = Math.min(m, dist[i - w] + D1);
+    if (x > 0 && y > 0) m = Math.min(m, dist[i - w - 1] + D2);
+    if (x < w - 1 && y > 0) m = Math.min(m, dist[i - w + 1] + D2);
+    dist[i] = m;
+  }
+  for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) {
+    const i = y * w + x; if (dist[i] === 0) continue;
+    let m = dist[i];
+    if (x < w - 1) m = Math.min(m, dist[i + 1] + D1);
+    if (y < h - 1) m = Math.min(m, dist[i + w] + D1);
+    if (x < w - 1 && y < h - 1) m = Math.min(m, dist[i + w + 1] + D2);
+    if (x > 0 && y < h - 1) m = Math.min(m, dist[i + w - 1] + D2);
+    dist[i] = m;
+  }
+  distCache = dist; distCacheKey = key;
+  return dist;
+}
+
+// Inward distance for a carve mask: for each masked pixel (mask >= threshold),
+// distance (px) to the nearest unmasked pixel. Used to ramp the carve up from 0
+// at the boundary to full toward the interior, giving it a sloped wall instead
+// of a vertical cliff (mirrors getEdgeDistance/edgeCut). Cached per mask.
+function getCarveDistance(mask) {
+  const key = `${mask.version}@${mask.params.invert ? 1 : 0}`;
+  if (mask.distCache && mask.distCacheKey === key) return mask.distCache;
+  const w = mask.w, h = mask.h, n = w * h, src = mask.data, inv = mask.params.invert;
+  const t = CARVE_MASK_THRESHOLD * 255;
+  const INF = 1e9, D1 = 1, D2 = Math.SQRT2;
+  const dist = new Float32Array(n);
+  for (let i = 0; i < n; i++) dist[i] = (inv ? src[i] < t : src[i] >= t) ? INF : 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x; if (dist[i] === 0) continue;
+    let m = dist[i];
+    if (x > 0) m = Math.min(m, dist[i - 1] + D1);
+    if (y > 0) m = Math.min(m, dist[i - w] + D1);
+    if (x > 0 && y > 0) m = Math.min(m, dist[i - w - 1] + D2);
+    if (x < w - 1 && y > 0) m = Math.min(m, dist[i - w + 1] + D2);
+    dist[i] = m;
+  }
+  for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) {
+    const i = y * w + x; if (dist[i] === 0) continue;
+    let m = dist[i];
+    if (x < w - 1) m = Math.min(m, dist[i + 1] + D1);
+    if (y < h - 1) m = Math.min(m, dist[i + w] + D1);
+    if (x < w - 1 && y < h - 1) m = Math.min(m, dist[i + w + 1] + D2);
+    if (x > 0 && y < h - 1) m = Math.min(m, dist[i + w - 1] + D2);
+    dist[i] = m;
+  }
+  mask.distCache = dist; mask.distCacheKey = key;
+  return dist;
+}
+
+// The carve masks currently active, each with its distance field + ramp width
+// precomputed. Shared by the relief preview and the STL mold.
+function activeCarves() {
+  return carveMasks
+    .filter(m => m.params.use && m.data)
+    .map(m => ({ mask: m, dist: getCarveDistance(m), edgePx: Math.max(1, m.params.edge * Math.min(m.w, m.h)) }));
+}
+// Total inward carve (depth-map units) at uv, summed over all active masks.
+function carveAt(carves, u, v) {
+  let sum = 0;
+  for (const c of carves) {
+    const m = c.mask;
+    const val = sampleMap(m.data, m.w, m.h, u, v);
+    const on = m.params.invert ? val < CARVE_MASK_THRESHOLD : val >= CARVE_MASK_THRESHOLD;
+    if (!on) continue;
+    const f = c.edgePx > 1 ? Math.min(1, sampleRaw(c.dist, m.w, m.h, u, v) / c.edgePx) : 1;
+    sum += f * m.params.carve;
+  }
+  return sum;
+}
+
+// Build the plane and push each vertex out by its depth, then recompute
+// normals so the lighting reflects the actual surface. Where the alpha map
+// cuts the area out, the vertex stays flat (no depth applied).
+function buildGeometry() {
+  if (geometry) geometry.dispose();
+  let w = 1.8, h = 1.8;
+  if (imageAspect >= 1) h = 1.8 / imageAspect; else w = 1.8 * imageAspect;
+  geometry = new THREE.PlaneGeometry(w, h, params.segments, params.segments);
+
+  if (depthData) {
+    const pos = geometry.attributes.position;
+    const sign = params.invertDepth ? -1 : 1;
+    const depthField = getDepthField();
+    const useA = params.useAlpha && alphaData;
+    const distField = useA ? getEdgeDistance() : null;
+    const edgePx = Math.max(1, params.edgeCut * Math.min(alphaW, alphaH));
+    const carves = activeCarves();
+    for (let i = 0; i < pos.count; i++) {
+      const u = pos.getX(i) / w + 0.5;
+      const v = pos.getY(i) / h + 0.5;
+      let d = (sampleMap(depthField, depthW, depthH, u, v) - 0.5) * sign; // center around 0
+      let cut = false;
+      if (useA) {
+        if (sampleMap(alphaData, alphaW, alphaH, u, v) < params.alphaThreshold) {
+          d = 0; cut = true; // background: cut out (hidden) and flat
+        } else if (edgePx > 1) {
+          // Inside the kept area: ramp depth to 0 within edgePx of the edge so
+          // the silhouette drops to the base plane -> looks like a clean cut.
+          const dist = sampleRaw(distField, alphaW, alphaH, u, v);
+          d *= Math.min(1, dist / edgePx);
+        }
+      }
+      // Carve masks (目 / アウトライン …): push each masked region deeper than
+      // the depth map alone, ramping from 0 at the boundary to full within
+      // edgePx (sloped wall, same idea as edgeCut at the silhouette).
+      if (!cut) d -= carveAt(carves, u, v);
+      pos.setZ(i, d * params.depthScale);
+    }
+    pos.needsUpdate = true;
+    geometry.computeVertexNormals();
+  }
+
+  if (mesh) mesh.geometry = geometry;
+}
+
+function applyMaterial() {
+  material.map = params.showTexture ? colorTexture : null;
+  material.color.set(params.showTexture ? 0xffffff : 0xc4ccd8);
+  material.wireframe = params.wireframe;
+  // Alpha map hides the cut-out (background) areas entirely.
+  if (params.useAlpha && alphaTexture) {
+    material.alphaMap = alphaTexture;
+    material.transparent = true;
+    material.alphaTest = params.alphaThreshold;
+  } else {
+    material.alphaMap = null;
+    material.transparent = false;
+    material.alphaTest = 0;
+  }
+  material.needsUpdate = true;
+}
+
+// ---------------------------------------------------------------------------
+// Depth model (Depth Anything V2 small) — loaded lazily on first image.
+// ---------------------------------------------------------------------------
+let depthEstimator = null;
+const progEl = document.getElementById('progress');
+const progFill = progEl.querySelector('.fill');
+const progLabel = progEl.querySelector('.label');
+const statusEl = document.getElementById('status');
+const hintEl = document.getElementById('hint');
+const previewEl = document.getElementById('preview');
+
+function showProgress(on) { progEl.classList.toggle('show', on); }
+function setProgress(pct, text) { progFill.style.width = `${pct}%`; if (text) progLabel.textContent = text; }
+function setStatus(t) { statusEl.textContent = t; }
+
+let loadedModel = null;   // which size is currently loaded
+
+async function getEstimator() {
+  if (depthEstimator && loadedModel === params.model) return depthEstimator;
+  if (depthEstimator) { await depthEstimator.dispose?.(); depthEstimator = null; }
+  const device = (navigator.gpu ? 'webgpu' : 'wasm');
+  setStatus(`モデル読み込み中 (${device})…`);
+  showProgress(true);
+  setProgress(2, 'AIモデルをダウンロード中…');
+  depthEstimator = await pipeline('depth-estimation', MODEL_INFO[params.model].id, {
+    device,
+    dtype: device === 'webgpu' ? 'fp32' : 'q8',
+    progress_callback: (p) => {
+      if (p.status === 'progress' && p.total) {
+        const pct = Math.round((p.loaded / p.total) * 100);
+        setProgress(pct, `モデルをダウンロード中… ${pct}%`);
+      } else if (p.status === 'ready') {
+        setProgress(100, 'モデル準備完了');
+      }
+    },
+  });
+  loadedModel = params.model;
+  return depthEstimator;
+}
+
+// Extract the model's RawImage depth into a plain grayscale buffer.
+function storeDepth(depth) {
+  const { data, width, height, channels } = depth;
+  const buf = new Uint8Array(width * height);
+  for (let i = 0; i < width * height; i++) buf[i] = data[i * channels]; // 1ch grayscale
+  depthData = buf; depthW = width; depthH = height; depthVersion++;
+}
+
+function loadImage(src) {
+  return new Promise((res, rej) => {
+    const im = new Image();
+    im.crossOrigin = 'anonymous';
+    im.onload = () => res(im); im.onerror = rej; im.src = src;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Nano Banana (Gemini) alpha map. Sends the source image and asks for an alpha
+// map, then turns the result into a grayscale buffer + texture used to mask
+// the mesh (keep = foreground, cut = background).
+// ---------------------------------------------------------------------------
+// Install a grayscale alpha buffer as alphaData + the material's alphaMap
+// texture. Shared by fresh generation and cache restore.
+function applyAlphaBuffer(buf, aw, ah) {
+  alphaData = buf; alphaW = aw; alphaH = ah; alphaVersion++;
+  const ac = document.createElement('canvas'); ac.width = aw; ac.height = ah;
+  const actx = ac.getContext('2d');
+  const gid = actx.createImageData(aw, ah);
+  for (let i = 0; i < aw * ah; i++) { gid.data[i*4]=gid.data[i*4+1]=gid.data[i*4+2]=buf[i]; gid.data[i*4+3]=255; }
+  actx.putImageData(gid, 0, 0);
+  if (alphaTexture) alphaTexture.dispose();
+  alphaTexture = new THREE.CanvasTexture(ac);
+  alphaTexture.colorSpace = THREE.NoColorSpace;
+  alphaTexture.needsUpdate = true;
+}
+
+// Install a grayscale buffer into a carve mask (and invalidate its distance
+// cache). Carve masks are not material alpha maps — they are only sampled by
+// buildGeometry / buildMoldTris to push their region deeper.
+function applyCarveBuffer(mask, buf, mw, mh) {
+  mask.data = buf; mask.w = mw; mask.h = mh; mask.version++;
+  mask.distCache = null;
+}
+
+// Core Nano Banana (Gemini) call: send the source image + a prompt, return the
+// result rasterized to a grayscale buffer. Uses the PNG's alpha channel if it
+// has real transparency, otherwise the luminance of the B/W matte. Shared by
+// the alpha map and the eye-region carve mask.
+async function nbRequestGray(image, prompt) {
+  const key = getApiKey();
+  if (!key) throw new Error('Gemini APIキーが未設定です');
+
+  // Encode source (downscaled) to base64 PNG.
+  const maxSide = 1024;
+  const s = Math.min(1, maxSide / Math.max(image.naturalWidth, image.naturalHeight));
+  const sw = Math.round(image.naturalWidth * s), sh = Math.round(image.naturalHeight * s);
+  const cv = document.createElement('canvas'); cv.width = sw; cv.height = sh;
+  cv.getContext('2d').drawImage(image, 0, 0, sw, sh);
+  const b64 = cv.toDataURL('image/png').split(',')[1];
+
+  const body = {
+    contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: 'image/png', data: b64 } }] }],
+    generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
+  };
+  const res = await fetch(`${NB_ENDPOINT}/${NB_MODEL}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const json = await res.json();
+  const parts = json.candidates?.[0]?.content?.parts || [];
+  const part = parts.find(p => p.inlineData || p.inline_data);
+  if (!part) throw new Error('画像が返りませんでした');
+  const inline = part.inlineData || part.inline_data;
+  const aimg = await loadImage(`data:${inline.mimeType || 'image/png'};base64,${inline.data}`);
+
+  const aw = aimg.naturalWidth, ah = aimg.naturalHeight;
+  const ac = document.createElement('canvas'); ac.width = aw; ac.height = ah;
+  const actx = ac.getContext('2d', { willReadFrequently: true });
+  actx.drawImage(aimg, 0, 0);
+  const id = actx.getImageData(0, 0, aw, ah).data;
+  let hasAlpha = false;
+  for (let i = 0; i < id.length; i += 4) { if (id[i + 3] < 250) { hasAlpha = true; break; } }
+  const N = aw * ah;
+  const buf = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    buf[i] = hasAlpha
+      ? id[i * 4 + 3]
+      : (id[i * 4] * 0.299 + id[i * 4 + 1] * 0.587 + id[i * 4 + 2] * 0.114);
+  }
+  return { buf, w: aw, h: ah };
+}
+
+// Nano Banana image generation: send a base64 PNG + prompt, return the
+// generated color image as a data URL. Used by 写真から生成 (camera -> chibi toy).
+async function nbGenerateImage(b64Png, prompt) {
+  const key = getApiKey();
+  if (!key) throw new Error('Gemini APIキーが未設定です');
+  const body = {
+    contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: 'image/png', data: b64Png } }] }],
+    generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
+  };
+  const res = await fetch(`${NB_ENDPOINT}/${NB_MODEL}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const json = await res.json();
+  const parts = json.candidates?.[0]?.content?.parts || [];
+  const part = parts.find(p => p.inlineData || p.inline_data);
+  if (!part) throw new Error('画像が返りませんでした');
+  const inline = part.inlineData || part.inline_data;
+  return `data:${inline.mimeType || 'image/png'};base64,${inline.data}`;
+}
+
+async function generateAlpha(image, force = false) {
+  const cacheKey = `alpha:${hashImage(image)}:${NB_MODEL}`;
+  if (!force) {
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+      const g = await grayFromPngDataUrl(cached);
+      applyAlphaBuffer(g.buf, g.w, g.h);
+      setStatus('アルファマップをキャッシュから復元');
+      return true;
+    }
+  }
+  if (!getApiKey()) { setStatus('Gemini APIキーが未設定です（🔑ボタンから入力）'); return false; }
+
+  setStatus('アルファマップを生成中 (Nano Banana)…');
+  setProgress(100, 'アルファマップを生成中…');
+  await new Promise(r => requestAnimationFrame(r));
+
+  const g = await nbRequestGray(image, NB_PROMPT);
+  applyAlphaBuffer(g.buf, g.w, g.h);
+  cacheSet(cacheKey, grayToPngDataUrl(g.buf, g.w, g.h));
+  return true;
+}
+
+// Generate one carve mask alongside the alpha map (same image, its own prompt).
+// Each mask is cached under its id so it is reused without re-calling Gemini.
+async function generateCarveMask(image, mask, force = false) {
+  const cacheKey = `${mask.id}:${hashImage(image)}:${NB_MODEL}`;
+  if (!force) {
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+      const g = await grayFromPngDataUrl(cached);
+      applyCarveBuffer(mask, g.buf, g.w, g.h);
+      return true;
+    }
+  }
+  if (!getApiKey()) return false;
+
+  setStatus(`${mask.label}マスクを生成中 (Nano Banana)…`);
+  await new Promise(r => requestAnimationFrame(r));
+
+  const g = await nbRequestGray(image, mask.prompt);
+  applyCarveBuffer(mask, g.buf, g.w, g.h);
+  cacheSet(cacheKey, grayToPngDataUrl(g.buf, g.w, g.h));
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Load + process an image
+// ---------------------------------------------------------------------------
+async function processImage(url, name) {
+  lastUrl = url; lastName = name;
+  showProgress(true);
+  setProgress(5, '画像を読み込み中…');
+
+  // Load for the color texture + aspect ratio.
+  const image = await loadImage(url);
+  currentImage = image;
+  // Step 1 standby: show just this image centered while the depth + mask
+  // pipeline below runs in the background. Hidden once the 3D mesh is ready.
+  previewEl.src = url;
+  previewEl.classList.add('show');
+  hintEl.classList.add('hidden');
+  if (mesh) mesh.visible = false;
+  imageAspect = image.naturalWidth / image.naturalHeight || 1;
+  alphaData = null; // invalidate previous mask until regenerated
+  carveMasks.forEach(m => { m.data = null; m.distCache = null; }); // invalidate carve masks
+  const imageHash = hashImage(image);
+
+  if (colorTexture) colorTexture.dispose();
+  colorTexture = new THREE.Texture(image);
+  colorTexture.colorSpace = THREE.SRGBColorSpace;
+  colorTexture.needsUpdate = true;
+
+  try {
+    // Depth map: reuse the cached result for this image+model if present,
+    // otherwise run the model and cache it (avoids re-downloading the model
+    // and re-inferring when switching back to a previously used size).
+    const depthKey = `depth:${imageHash}:${params.model}`;
+    const cachedDepth = cacheGet(depthKey);
+    if (cachedDepth) {
+      const g = await grayFromPngDataUrl(cachedDepth);
+      depthData = g.buf; depthW = g.w; depthH = g.h; depthVersion++;
+      setStatus('深度をキャッシュから復元');
+    } else {
+      const estimator = await getEstimator();
+      setStatus('深度を推定中…');
+      setProgress(100, '深度を推定中…（数秒）');
+      // Yield a frame so the UI updates before the heavy inference.
+      await new Promise(r => requestAnimationFrame(r));
+
+      const out = await estimator(url);
+      storeDepth(out.depth);
+      cacheSet(depthKey, grayToPngDataUrl(depthData, depthW, depthH));
+    }
+
+    // Generate the alpha map (masking) and every carve mask (目 / アウトライン
+    // …) together — same image, different prompts. All serve from cache when
+    // available, so a repeat of the same image needs no API key. Best-effort:
+    // a failure just skips that effect.
+    const maskTasks = [];
+    if (params.useAlpha) maskTasks.push(
+      generateAlpha(image).catch(e => { console.error(e); setStatus('アルファ生成に失敗: ' + (e?.message || e)); }));
+    for (const m of carveMasks) {
+      if (m.params.use) maskTasks.push(
+        generateCarveMask(image, m).catch(e => { console.error(e); setStatus(`${m.label}マスク生成に失敗: ` + (e?.message || e)); }));
+    }
+    if (maskTasks.length) await Promise.all(maskTasks);
+
+    if (!mesh) { buildGeometry(); mesh = new THREE.Mesh(geometry, material); scene.add(mesh); }
+    else buildGeometry();
+    applyMaterial();
+    if (mesh) mesh.visible = !params.previewMold;   // reveal the 3D result
+
+    hintEl.classList.add('hidden');
+    setStatus(`${name}  ·  ${image.naturalWidth}×${image.naturalHeight}`);
+  } catch (err) {
+    console.error(err);
+    setStatus('深度推定に失敗: ' + (err?.message || err));
+  } finally {
+    showProgress(false);
+    previewEl.classList.remove('show');   // end step 1 standby (3D ready or failed)
+  }
+}
+
+let activeObjectUrl = null;
+function loadFromFile(file) {
+  if (!file || !file.type.startsWith('image/')) { setStatus('画像ファイルではありません'); return; }
+  // Keep the object URL alive so the model selector can re-run on the same
+  // image; revoke only when a new file replaces it.
+  if (activeObjectUrl) URL.revokeObjectURL(activeObjectUrl);
+  activeObjectUrl = URL.createObjectURL(file);
+  processImage(activeObjectUrl, file.name);
+}
+
+// ---------------------------------------------------------------------------
+// STL mold export
+//
+// Builds a watertight solid cuboid (footprint W×H, total height Z) with the
+// relief carved into the top face, so it can be cast/molded. The cavity is
+// deepest where the positive relief is tallest. Background / silhouette sit at
+// the rim (no cavity). Exports binary STL in millimetres.
+// ---------------------------------------------------------------------------
+function buildMoldTris() {
+  if (!depthData) { setStatus('先に画像を読み込んでください'); return null; }
+
+  const aspect = params.boxAspect > 0 ? params.boxAspect : imageAspect;
+  const W = params.boxWidthMM;
+  const H = W / aspect;
+  const gx = params.exportRes;
+  const gy = Math.max(8, Math.round(params.exportRes / aspect));
+  const NX = gx + 1, NY = gy + 1;
+
+  // Relief sub-rectangle: contain the image (its own aspect) inside the box.
+  const ia = imageAspect;
+  let rW, rH;
+  if (ia >= aspect) { rW = W; rH = W / ia; } else { rH = H; rW = H * ia; }
+  const rX0 = -rW / 2, rY0 = -rH / 2;
+
+  const useA = params.useAlpha && alphaData;
+  const distField = useA ? getEdgeDistance() : null;
+  const edgePx = Math.max(1, params.edgeCut * Math.min(alphaW, alphaH));
+  const carves = activeCarves();
+
+  // Relief height in mm, computed with the SAME transfer as the relief preview
+  // (buildGeometry): disp = ((depth-0.5)*sign * edgeFactor) * depthScale, then
+  // mm = max(0, disp) * MOLD_MM_PER_UNIT. No maxRel normalisation, so the
+  // depth contrast and the depthScale multiplier behave exactly like the
+  // preview. keepG marks the subject area (where the offset recess applies).
+  const sign = params.invertDepth ? -1 : 1;
+  const depthField = getDepthField();
+  const relMM = new Float32Array(NX * NY);
+  const keepG = new Uint8Array(NX * NY);
+  let maxReliefMM = 0;
+  for (let j = 0; j < NY; j++) {
+    const Y = -H / 2 + (j / gy) * H;
+    for (let i = 0; i < NX; i++) {
+      const X = -W / 2 + (i / gx) * W;
+      let mm = 0, keep = 0;
+      if (X >= rX0 && X <= rX0 + rW && Y >= rY0 && Y <= rY0 + rH) {
+        const u = (X - rX0) / rW, v = (Y - rY0) / rH;
+        if (!useA || sampleMap(alphaData, alphaW, alphaH, u, v) >= params.alphaThreshold) {
+          keep = 1;
+          let d = (sampleMap(depthField, depthW, depthH, u, v) - 0.5) * sign;
+          if (useA && edgePx > 1) d *= Math.min(1, sampleRaw(distField, alphaW, alphaH, u, v) / edgePx);
+          // Same carve masks (with the boundary ramp) as the relief preview,
+          // so the mold matches.
+          d -= carveAt(carves, u, v);
+          mm = Math.max(0, d * params.depthScale) * MOLD_MM_PER_UNIT;
+        }
+      }
+      relMM[j * NX + i] = mm; keepG[j * NX + i] = keep;
+      if (mm > maxReliefMM) maxReliefMM = mm;
+    }
+  }
+
+  const Ztot = params.offsetMM + maxReliefMM + params.marginMM;
+  const X = (i) => -W / 2 + (i / gx) * W;
+  const Y = (j) => -H / 2 + (j / gy) * H;
+  // Relief amount (mm) above the "depth 0" plane: subject = offset(flat recess)
+  // + relief(mm); rim/background = 0.
+  const carveMM = (i, j) => {
+    const k = j * NX + i;
+    return (keepG[k] ? params.offsetMM : 0) + relMM[k];
+  };
+  // cavity:   zTop = Ztot - carve  → background sits high (Ztot), deepest relief
+  //           is recessed down to marginMM (a negative mold).
+  // positive: zTop = marginMM + carve → background is a flat base plate at
+  //           marginMM, the relief rises out of it up to Ztot (the real form).
+  const positive = params.castType === 'positive';
+  const zTop = positive
+    ? (i, j) => params.marginMM + carveMM(i, j)
+    : (i, j) => Ztot - carveMM(i, j);
+
+  // Footprint: which grid cells are part of the solid.
+  //   'box'     -> every cell (full rectangular cuboid; original behaviour).
+  //   'outline' -> only cells within outlineMM of the kept silhouette, so the
+  //                outer wall follows the alpha contour offset outward. Needs
+  //                an alpha mask (otherwise there is no silhouette to follow).
+  const outline = params.moldShape === 'outline' && useA;
+  if (params.moldShape === 'outline' && !useA) {
+    setStatus('輪郭モードはアルファマスクが必要です（マスクをON）');
+  }
+  const solidCell = new Uint8Array(gx * gy);
+  if (outline) {
+    // Distance (mm) from each grid node to the nearest kept node, via a
+    // two-pass chamfer transform with per-axis cell spacing.
+    const dxmm = W / gx, dymm = H / gy, D2mm = Math.hypot(dxmm, dymm), INF = 1e9;
+    const dist = new Float32Array(NX * NY);
+    for (let k = 0; k < NX * NY; k++) dist[k] = keepG[k] ? 0 : INF;
+    for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) {
+      const k = j * NX + i; if (dist[k] === 0) continue; let m = dist[k];
+      if (i > 0) m = Math.min(m, dist[k - 1] + dxmm);
+      if (j > 0) m = Math.min(m, dist[k - NX] + dymm);
+      if (i > 0 && j > 0) m = Math.min(m, dist[k - NX - 1] + D2mm);
+      if (i < NX - 1 && j > 0) m = Math.min(m, dist[k - NX + 1] + D2mm);
+      dist[k] = m;
+    }
+    for (let j = NY - 1; j >= 0; j--) for (let i = NX - 1; i >= 0; i--) {
+      const k = j * NX + i; if (dist[k] === 0) continue; let m = dist[k];
+      if (i < NX - 1) m = Math.min(m, dist[k + 1] + dxmm);
+      if (j < NY - 1) m = Math.min(m, dist[k + NX] + dymm);
+      if (i < NX - 1 && j < NY - 1) m = Math.min(m, dist[k + NX + 1] + D2mm);
+      if (i > 0 && j < NY - 1) m = Math.min(m, dist[k + NX - 1] + D2mm);
+      dist[k] = m;
+    }
+    const node = new Uint8Array(NX * NY);
+    for (let k = 0; k < NX * NY; k++) node[k] = dist[k] <= params.outlineMM ? 1 : 0;
+    // A cell is solid if any of its 4 corner nodes is within the offset band,
+    // so the kept silhouette is always fully enclosed by the frame.
+    for (let j = 0; j < gy; j++) for (let i = 0; i < gx; i++) {
+      solidCell[j * gx + i] = (node[j*NX+i] || node[j*NX+i+1] ||
+        node[(j+1)*NX+i] || node[(j+1)*NX+i+1]) ? 1 : 0;
+    }
+  } else {
+    solidCell.fill(1);
+  }
+  const isSolid = (i, j) => (i < 0 || j < 0 || i >= gx || j >= gy) ? 0 : solidCell[j * gx + i];
+
+  // Triangle accumulation; normals forced to a desired outward direction.
+  const tris = [];
+  function pushTri(a, b, c, dir) {
+    let ux = b[0]-a[0], uy = b[1]-a[1], uz = b[2]-a[2];
+    let vx = c[0]-a[0], vy = c[1]-a[1], vz = c[2]-a[2];
+    let nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
+    if (nx*dir[0] + ny*dir[1] + nz*dir[2] < 0) { const t=b; b=c; c=t; nx=-nx; ny=-ny; nz=-nz; }
+    const l = Math.hypot(nx, ny, nz) || 1;
+    tris.push({ n: [nx/l, ny/l, nz/l], a, b, c });
+  }
+  const quad = (a, b, c, d, dir) => { pushTri(a, b, c, dir); pushTri(a, c, d, dir); };
+  const UP = [0,0,1], DN = [0,0,-1];
+
+  // Top (carved) + bottom (flat) for each solid cell.
+  for (let j = 0; j < gy; j++) for (let i = 0; i < gx; i++) {
+    if (!solidCell[j * gx + i]) continue;
+    quad([X(i),Y(j),zTop(i,j)], [X(i+1),Y(j),zTop(i+1,j)],
+         [X(i+1),Y(j+1),zTop(i+1,j+1)], [X(i),Y(j+1),zTop(i,j+1)], UP);
+    quad([X(i),Y(j),0], [X(i+1),Y(j),0], [X(i+1),Y(j+1),0], [X(i),Y(j+1),0], DN);
+  }
+  // Side walls wherever a solid cell borders a non-solid cell or the grid edge.
+  // Adjacent cells share boundary nodes (and their zTop) -> watertight. For the
+  // 'box' footprint this reduces to the four outer rectangle walls.
+  for (let j = 0; j < gy; j++) for (let i = 0; i < gx; i++) {
+    if (!solidCell[j * gx + i]) continue;
+    if (!isSolid(i-1, j)) quad([X(i),Y(j),zTop(i,j)], [X(i),Y(j+1),zTop(i,j+1)], [X(i),Y(j+1),0], [X(i),Y(j),0], [-1,0,0]);
+    if (!isSolid(i+1, j)) quad([X(i+1),Y(j),zTop(i+1,j)], [X(i+1),Y(j+1),zTop(i+1,j+1)], [X(i+1),Y(j+1),0], [X(i+1),Y(j),0], [1,0,0]);
+    if (!isSolid(i, j-1)) quad([X(i),Y(j),zTop(i,j)], [X(i+1),Y(j),zTop(i+1,j)], [X(i+1),Y(j),0], [X(i),Y(j),0], [0,-1,0]);
+    if (!isSolid(i, j+1)) quad([X(i),Y(j+1),zTop(i,j+1)], [X(i+1),Y(j+1),zTop(i+1,j+1)], [X(i+1),Y(j+1),0], [X(i),Y(j+1),0], [0,1,0]);
+  }
+
+  // Optional base cuboid welded under the model. It's a separate closed box from
+  // z=-baseThick up to a small overlap into the model floor (so the two solids
+  // share volume, not just a coplanar face — slicers union overlapping volumes
+  // cleanly but dislike coincident planes). The overlap is clamped to the floor
+  // thickness (marginMM) so it never pokes through the top surface.
+  let totalZtot = Ztot;
+  if (params.addBase) {
+    const bw = params.baseWidthMM, bh = params.baseHeightMM, bt = params.baseThickMM;
+    const ov = Math.min(0.2, params.marginMM);
+    const bx0 = -bw / 2, bx1 = bw / 2, by0 = -bh / 2, by1 = bh / 2, bz0 = -bt, bz1 = ov;
+    const box = (a, b, c, d, dir) => quad(a, b, c, d, dir);
+    box([bx0,by0,bz1],[bx1,by0,bz1],[bx1,by1,bz1],[bx0,by1,bz1], UP);            // top
+    box([bx0,by0,bz0],[bx1,by0,bz0],[bx1,by1,bz0],[bx0,by1,bz0], DN);            // bottom
+    box([bx0,by0,bz0],[bx1,by0,bz0],[bx1,by0,bz1],[bx0,by0,bz1], [0,-1,0]);      // -Y
+    box([bx0,by1,bz0],[bx1,by1,bz0],[bx1,by1,bz1],[bx0,by1,bz1], [0,1,0]);       // +Y
+    box([bx0,by0,bz0],[bx0,by1,bz0],[bx0,by1,bz1],[bx0,by0,bz1], [-1,0,0]);      // -X
+    box([bx1,by0,bz0],[bx1,by1,bz0],[bx1,by1,bz1],[bx1,by0,bz1], [1,0,0]);       // +X
+    totalZtot = Ztot + bt;
+  }
+
+  return { tris, W, H, Ztot: totalZtot };
+}
+
+// Build a Three.js geometry (flat-shaded, matching the STL) from the triangles.
+function moldGeometryFromTris(tris) {
+  const n = tris.length;
+  const pos = new Float32Array(n * 9), nor = new Float32Array(n * 9);
+  for (let k = 0; k < n; k++) {
+    const t = tris[k], o = k * 9, vs = [t.a, t.b, t.c];
+    for (let m = 0; m < 3; m++) {
+      pos[o+m*3] = vs[m][0]; pos[o+m*3+1] = vs[m][1]; pos[o+m*3+2] = vs[m][2];
+      nor[o+m*3] = t.n[0];   nor[o+m*3+1] = t.n[1];   nor[o+m*3+2] = t.n[2];
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  g.center();   // recenter for framing in the preview
+  return g;
+}
+
+let moldMesh = null;
+const moldMaterial = new THREE.MeshStandardMaterial({
+  color: 0xb9c0cc, roughness: 0.8, metalness: 0.0, side: THREE.DoubleSide, flatShading: true,
+});
+
+// ---------------------------------------------------------------------------
+// Dimension overlay — draws W×H×Z measurement lines + billboard text labels on
+// the mold preview so the real output size can be eyeballed. Dimensions come
+// from the ACTUAL triangle bounding box, not the nominal boxWidthMM: in
+// 'outline' mode the printed footprint follows the silhouette and is smaller
+// than the WxH grid, which is exactly the size mismatch we want to surface.
+// The overlay is a scene child; every line/label coordinate is mapped through
+// the same center + MOLD_PREVIEW_FIT transform as the centred solid, so it
+// stays aligned with the rendered mold.
+// ---------------------------------------------------------------------------
+const dimGroup = new THREE.Group();
+dimGroup.visible = false;
+scene.add(dimGroup);
+
+// Throw away the previous overlay's geometries / textures before rebuilding so
+// repeated previews don't leak GPU resources.
+function clearDimGroup() {
+  for (const child of dimGroup.children) {
+    child.geometry?.dispose();
+    if (child.material) {
+      child.material.map?.dispose();
+      child.material.dispose();
+    }
+  }
+  dimGroup.clear();
+}
+
+// A billboard text label: text rasterised to a canvas -> CanvasTexture -> Sprite
+// (Sprites always face the camera, so the labels stay readable from any angle).
+// `worldH` is the label height in preview world-units; width follows the canvas
+// aspect. depthTest off so labels never get hidden inside the solid.
+function makeDimLabel(text, worldH = 0.1) {
+  const fs = 64, padX = 24, padY = 14;
+  const c = document.createElement('canvas');
+  let ctx = c.getContext('2d');
+  ctx.font = `bold ${fs}px system-ui, -apple-system, sans-serif`;
+  const tw = Math.ceil(ctx.measureText(text).width);
+  c.width = tw + padX * 2;
+  c.height = fs + padY * 2;
+  ctx = c.getContext('2d');
+  ctx.font = `bold ${fs}px system-ui, -apple-system, sans-serif`;
+  // Pill background for contrast against the model and the dark scene.
+  ctx.fillStyle = 'rgba(16,20,30,0.82)';
+  const r = c.height / 2;
+  ctx.beginPath();
+  ctx.moveTo(r, 0); ctx.arcTo(c.width, 0, c.width, c.height, r);
+  ctx.arcTo(c.width, c.height, 0, c.height, r); ctx.arcTo(0, c.height, 0, 0, r);
+  ctx.arcTo(0, 0, c.width, 0, r); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#eaf0ff';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(text, c.width / 2, c.height / 2);
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, transparent: true, depthTest: false, depthWrite: false,
+  }));
+  sprite.scale.set(worldH * (c.width / c.height), worldH, 1);
+  sprite.renderOrder = 999;
+  return sprite;
+}
+
+const DIM_COLOR = 0x6aa9ff;
+// A polyline (in mm coords) -> world-space Line, mapped through the same
+// center+scale transform as the centred mold geometry.
+function makeDimLine(ptsMM, cx, cy, cz, fit) {
+  const pts = ptsMM.map(p => new THREE.Vector3((p[0]-cx)*fit, (p[1]-cy)*fit, (p[2]-cz)*fit));
+  const g = new THREE.BufferGeometry().setFromPoints(pts);
+  const m = new THREE.LineBasicMaterial({ color: DIM_COLOR, depthTest: false, transparent: true });
+  const line = new THREE.Line(g, m);
+  line.renderOrder = 998;
+  return line;
+}
+
+// Rebuild the dimension overlay for a mold result (tris + W/H/Ztot). Measures
+// the real bounding box of the triangles so the labels report the true size.
+function buildDimensions(r) {
+  clearDimGroup();
+  if (!params.showDims) { dimGroup.visible = false; return; }
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const t of r.tris) for (const v of [t.a, t.b, t.c]) {
+    if (v[0] < minX) minX = v[0]; if (v[0] > maxX) maxX = v[0];
+    if (v[1] < minY) minY = v[1]; if (v[1] > maxY) maxY = v[1];
+    if (v[2] < minZ) minZ = v[2]; if (v[2] > maxZ) maxZ = v[2];
+  }
+  if (!isFinite(minX)) { dimGroup.visible = false; return; }
+
+  const fit = MOLD_PREVIEW_FIT;
+  // moldGeometryFromTris centred the geometry on its bbox, so use the same
+  // center here to keep the overlay aligned with the rendered solid.
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
+  const dimX = maxX - minX, dimY = maxY - minY, dimZ = maxZ - minZ;
+  const off = Math.max(dimX, dimY) * 0.06 + 1;     // line offset outside the box (mm)
+  const tick = off * 0.5;                            // end-tick length (mm)
+  const labelH = Math.max(dimX, dimY) * fit * 0.07;  // label size in world units
+
+  // Width (X) — along the bottom edge, dropped below in -Y, at the near Z face.
+  const wy = minY - off, wz = maxZ;
+  dimGroup.add(makeDimLine([[minX, minY, wz], [minX, wy - tick, wz]], cx, cy, cz, fit));
+  dimGroup.add(makeDimLine([[maxX, minY, wz], [maxX, wy - tick, wz]], cx, cy, cz, fit));
+  dimGroup.add(makeDimLine([[minX, wy, wz], [maxX, wy, wz]], cx, cy, cz, fit));
+  let lbl = makeDimLabel(`横 ${dimX.toFixed(1)} mm`, labelH);
+  lbl.position.set(((minX+maxX)/2 - cx)*fit, (wy - off - cy)*fit, (wz - cz)*fit);
+  dimGroup.add(lbl);
+
+  // Height (Y, the image's vertical -> box depth) — along the left edge in -X.
+  const hx = minX - off;
+  dimGroup.add(makeDimLine([[minX, minY, wz], [hx - tick, minY, wz]], cx, cy, cz, fit));
+  dimGroup.add(makeDimLine([[minX, maxY, wz], [hx - tick, maxY, wz]], cx, cy, cz, fit));
+  dimGroup.add(makeDimLine([[hx, minY, wz], [hx, maxY, wz]], cx, cy, cz, fit));
+  lbl = makeDimLabel(`縦 ${dimY.toFixed(1)} mm`, labelH);
+  lbl.position.set((hx - off - cx)*fit, ((minY+maxY)/2 - cy)*fit, (wz - cz)*fit);
+  dimGroup.add(lbl);
+
+  // Thickness (Z, total mold height) — vertical line at the +X / -Y corner.
+  const tx = maxX + off, ty = minY - off;
+  dimGroup.add(makeDimLine([[tx, ty, minZ], [tx, ty, maxZ]], cx, cy, cz, fit));
+  dimGroup.add(makeDimLine([[tx - tick, ty, minZ], [tx, ty, minZ]], cx, cy, cz, fit));
+  dimGroup.add(makeDimLine([[tx - tick, ty, maxZ], [tx, ty, maxZ]], cx, cy, cz, fit));
+  lbl = makeDimLabel(`厚 ${dimZ.toFixed(1)} mm`, labelH);
+  lbl.position.set((tx + off - cx)*fit, (ty - cy)*fit, ((minZ+maxZ)/2 - cz)*fit);
+  dimGroup.add(lbl);
+
+  dimGroup.visible = true;
+}
+
+// Toggle between the relief view and the carved-mold solid.
+function showMold(on) {
+  if (on) {
+    const r = buildMoldTris();
+    if (!r) { params.previewMold = false; gui.controllersRecursive().forEach(c => c.updateDisplay()); return; }
+    const g = moldGeometryFromTris(r.tris);
+    if (moldMesh) { moldMesh.geometry.dispose(); moldMesh.geometry = g; }
+    else { moldMesh = new THREE.Mesh(g, moldMaterial); scene.add(moldMesh); }
+    moldMesh.scale.setScalar(MOLD_PREVIEW_FIT);   // fixed mm->units, so width & depth are independent
+    moldMesh.visible = true;
+    if (mesh) mesh.visible = false;
+    buildDimensions(r);   // overlay W×H×Z measurement lines + labels
+    setStatus(`型プレビュー: ${r.W.toFixed(0)}×${r.H.toFixed(0)}×${r.Ztot.toFixed(1)}mm / ${r.tris.length.toLocaleString()}面`);
+  } else {
+    if (moldMesh) moldMesh.visible = false;
+    dimGroup.visible = false;
+    if (mesh) mesh.visible = true;
+  }
+}
+const updateMoldPreview = () => { if (params.previewMold) showMold(true); };
+
+function generateMoldSTL() {
+  const r = buildMoldTris();
+  if (!r) return;
+  const tris = r.tris;
+  const buf = new ArrayBuffer(84 + tris.length * 50);
+  const dv = new DataView(buf);
+  dv.setUint32(80, tris.length, true);
+  let o = 84;
+  for (const t of tris) {
+    dv.setFloat32(o, t.n[0], true); dv.setFloat32(o+4, t.n[1], true); dv.setFloat32(o+8, t.n[2], true);
+    let p = o + 12;
+    for (const v of [t.a, t.b, t.c]) {
+      dv.setFloat32(p, v[0], true); dv.setFloat32(p+4, v[1], true); dv.setFloat32(p+8, v[2], true); p += 12;
+    }
+    dv.setUint16(o + 48, 0, true);
+    o += 50;
+  }
+  const blob = new Blob([buf], { type: 'application/octet-stream' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  const suffix = params.castType === 'positive' ? '_model' : '_mold';
+  a.download = (lastName ? lastName.replace(/\.[^.]+$/, '') : 'mold') + suffix + '.stl';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  setStatus(`STL出力: ${r.W.toFixed(0)}×${r.H.toFixed(0)}×${r.Ztot.toFixed(1)}mm / ${tris.length.toLocaleString()}面`);
+}
+
+// ---------------------------------------------------------------------------
+// GUI
+// ---------------------------------------------------------------------------
+const gui = new GUI({ title: 'コントロール' });
+gui.add(params, 'model', { '小・高速': 'small', '中': 'base', '大・高品質': 'large' })
+  .name('AIモデル')
+  .onChange(() => {
+    setStatus(`モデル: ${MODEL_INFO[params.model].note}`);
+    if (lastUrl) processImage(lastUrl, lastName);   // re-run on the current image
+  });
+const rebuild = () => { if (mesh) buildGeometry(); };
+const refresh = () => { rebuild(); applyMaterial(); };
+gui.add(params, 'depthScale', 0, 1.5, 0.01).name('立体の深さ (凹凸感)').onChange(() => { rebuild(); updateMoldPreview(); });
+gui.add(params, 'smooth', 0, 5, 0.1).name('深度なめらか (段差抑制)').onChange(() => { rebuild(); updateMoldPreview(); });
+gui.add(params, 'invertDepth').name('奥行き反転').onChange(() => { rebuild(); updateMoldPreview(); });
+gui.add(params, 'showTexture').name('写真を貼る').onChange(applyMaterial);
+gui.add(params, 'wireframe').name('ワイヤーフレーム').onChange(applyMaterial);
+gui.add(params, 'segments', { '128': 128, '256': 256, '384': 384, '512': 512 })
+  .name('メッシュ分割(プレビュー)').onChange(() => { rebuild(); updateMoldPreview(); });
+gui.add(params, 'autoRotate').name('自動回転');
+
+// Alpha-map masking (Nano Banana)
+const fAlpha = gui.addFolder('アルファマスク (Nano Banana)');
+fAlpha.add(params, 'useAlpha').name('マスクを使う').onChange(async () => {
+  // Turning it on for the first time on a loaded image triggers generation.
+  if (params.useAlpha && !alphaData && currentImage && getApiKey()) {
+    showProgress(true);
+    try { await generateAlpha(currentImage); } catch (e) { setStatus('アルファ生成に失敗: ' + (e?.message || e)); }
+    showProgress(false);
+  }
+  refresh();
+});
+fAlpha.add(params, 'alphaThreshold', 0, 1, 0.01).name('しきい値').onChange(() => { refresh(); updateMoldPreview(); });
+fAlpha.add(params, 'edgeCut', 0, 0.2, 0.005).name('断面化(縁幅)').onChange(() => { rebuild(); updateMoldPreview(); });
+fAlpha.add({ regen: async () => {
+  if (!currentImage) { setStatus('先に画像を読み込んでください'); return; }
+  showProgress(true);
+  try { await generateAlpha(currentImage, true); refresh(); } catch (e) { setStatus('アルファ生成に失敗: ' + (e?.message || e)); }
+  showProgress(false);
+} }, 'regen').name('再生成');
+
+// Carve masks (目 / アウトライン …) — each is a separate Nano Banana mask that
+// drives extra inward depth on top of the depth map. Same controls per mask.
+for (const m of carveMasks) {
+  const f = gui.addFolder(`${m.label}の掘り込み (Nano Banana)`);
+  f.add(m.params, 'use').name(`${m.label}を掘り込む`).onChange(async () => {
+    // Turning it on for the first time on a loaded image triggers generation.
+    if (m.params.use && !m.data && currentImage && getApiKey()) {
+      showProgress(true);
+      try { await generateCarveMask(currentImage, m); } catch (e) { setStatus(`${m.label}マスク生成に失敗: ` + (e?.message || e)); }
+      showProgress(false);
+    }
+    rebuild(); updateMoldPreview();
+  });
+  f.add(m.params, 'carve', 0, 1, 0.01).name('掘り込みの深さ').onChange(() => { rebuild(); updateMoldPreview(); });
+  f.add(m.params, 'edge', 0, 0.2, 0.005).name('縁の勾配幅').onChange(() => { rebuild(); updateMoldPreview(); });
+  f.add(m.params, 'invert').name('白黒反転').onChange(() => { rebuild(); updateMoldPreview(); });
+  f.add({ regen: async () => {
+    if (!currentImage) { setStatus('先に画像を読み込んでください'); return; }
+    showProgress(true);
+    try { await generateCarveMask(currentImage, m, true); rebuild(); updateMoldPreview(); }
+    catch (e) { setStatus(`${m.label}マスク生成に失敗: ` + (e?.message || e)); }
+    showProgress(false);
+  } }, 'regen').name('再生成');
+}
+
+// STL mold export
+const fStl = gui.addFolder('STL出力（型）');
+fStl.add(params, 'castType', { '鋳型（凹・型を作る）': 'cavity', '本体（凸・形状そのもの）': 'positive' })
+  .name('出力タイプ').onChange(updateMoldPreview);
+fStl.add(params, 'moldShape', { '直方体': 'box', '輪郭+オフセット': 'outline' })
+  .name('型の形状').onChange(updateMoldPreview);
+fStl.add(params, 'outlineMM', 0, 30, 0.5).name('外周オフセット幅(mm)').onChange(updateMoldPreview);
+fStl.add(params, 'offsetMM', 0, 30, 0.5).name('オフセット(mm)').onChange(updateMoldPreview);
+fStl.add(params, 'marginMM', 0, 50, 0.5).name('底マージン(mm)').onChange(updateMoldPreview);
+fStl.add(params, 'boxWidthMM', 10, 300, 1).name('横幅(mm)').onChange(updateMoldPreview);
+fStl.add(params, 'boxAspect', {
+  '画像に合わせる': 0, '1:1': 1, '4:3': 4/3, '3:4': 3/4, '16:9': 16/9, '9:16': 9/16,
+}).name('直方体の縦横比').onChange(updateMoldPreview);
+fStl.add(params, 'exportRes', { '128': 128, '192': 192, '256': 256, '384': 384, '512': 512 })
+  .name('STL解像度(型の細かさ)').onChange(updateMoldPreview);
+fStl.add(params, 'previewMold').name('型をプレビュー').onChange(() => showMold(params.previewMold));
+fStl.add(params, 'showDims').name('寸法を表示').onChange(updateMoldPreview);
+
+// Base cuboid (台座) — an arbitrary W×H×厚み box welded under the model and
+// merged into the same exported solid.
+const fBase = fStl.addFolder('台座（直方体を結合）');
+fBase.add(params, 'addBase').name('台座を付ける').onChange(updateMoldPreview);
+fBase.add(params, 'baseWidthMM', 5, 300, 1).name('幅(mm)').onChange(updateMoldPreview);
+fBase.add(params, 'baseHeightMM', 5, 300, 1).name('高さ・奥行き(mm)').onChange(updateMoldPreview);
+fBase.add(params, 'baseThickMM', 1, 100, 0.5).name('厚み(mm)').onChange(updateMoldPreview);
+
+fStl.add({ export: () => generateMoldSTL() }, 'export').name('⬇ STL書き出し');
+
+// ---------------------------------------------------------------------------
+// Input wiring
+// ---------------------------------------------------------------------------
+const fileInput = document.getElementById('file');
+document.getElementById('open').addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', (e) => { if (e.target.files[0]) loadFromFile(e.target.files[0]); });
+
+// 写真から生成 — open the webcam, let the user edit the prompt, then send the
+// captured frame + prompt to Nano Banana. The generated image becomes the
+// source image and flows through the normal depth/mask pipeline (processImage).
+const camPanel = document.getElementById('camPanel');
+const camVideo = document.getElementById('camVideo');
+const camPhoto = document.getElementById('camPhoto');
+const camPrompt = document.getElementById('camPrompt');
+const camFile = document.getElementById('camFile');
+let camStream = null;
+let camAlbumImage = null;   // picked-from-album source (used instead of the live frame)
+let camAlbumUrl = null;     // its object URL (revoked when replaced / on close)
+
+// Drop album state and release any object URL.
+function clearAlbum() {
+  camPanel.classList.remove('album');
+  camAlbumImage = null;
+  camPhoto.removeAttribute('src');
+  if (camAlbumUrl) { URL.revokeObjectURL(camAlbumUrl); camAlbumUrl = null; }
+}
+
+// Stop the camera so the device light/stream isn't left running.
+function stopStream() {
+  if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null; }
+  camVideo.pause();
+  camVideo.srcObject = null;
+}
+
+async function openCamera() {
+  if (!camPrompt.value) camPrompt.value = DEFAULT_GEN_PROMPT;
+  clearAlbum();   // always start in live-camera mode
+  camPanel.classList.remove('hidden');
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+    camVideo.srcObject = camStream;
+  } catch (e) {
+    // No camera (or denied): stay open in album-only mode so the user can still
+    // pick a photo from their library.
+    setStatus('カメラを起動できません（アルバムから選択できます）: ' + (e?.message || e));
+  }
+}
+
+function closeCamera() {
+  camPanel.classList.add('hidden');
+  stopStream();
+  clearAlbum();
+}
+
+// Capture the source for generation as a base64 PNG: the picked album photo if
+// one is selected, otherwise the current live camera frame. Album photos are
+// downscaled to <=1024px on the long side (matching nbRequestGray).
+function captureSourceB64() {
+  if (camAlbumImage) {
+    const img = camAlbumImage, maxSide = 1024;
+    const s = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
+    const sw = Math.round(img.naturalWidth * s), sh = Math.round(img.naturalHeight * s);
+    const cv = document.createElement('canvas'); cv.width = sw; cv.height = sh;
+    cv.getContext('2d').drawImage(img, 0, 0, sw, sh);
+    return cv.toDataURL('image/png').split(',')[1];
+  }
+  if (!camStream || !camVideo.videoWidth) return null;
+  const cv = document.createElement('canvas');
+  cv.width = camVideo.videoWidth; cv.height = camVideo.videoHeight;
+  cv.getContext('2d').drawImage(camVideo, 0, 0);
+  return cv.toDataURL('image/png').split(',')[1];
+}
+
+async function generateFromCamera() {
+  if (!getApiKey()) { setStatus('Gemini APIキーが未設定です（🔑ボタンから入力）'); return; }
+  const prompt = camPrompt.value.trim() || DEFAULT_GEN_PROMPT;
+
+  const b64 = captureSourceB64();
+  if (!b64) { setStatus('カメラ映像がまだ準備できていません（またはアルバムから選択）'); return; }
+
+  showProgress(true);
+  setProgress(40, '写真から画像を生成中 (Nano Banana)…');
+  setStatus('写真から画像を生成中 (Nano Banana)…');
+  await new Promise(r => requestAnimationFrame(r));
+  try {
+    const dataUrl = await nbGenerateImage(b64, prompt);
+    closeCamera();
+    await processImage(dataUrl, 'generated.png');   // depth / mask pipeline on the result
+  } catch (e) {
+    console.error(e);
+    setStatus('画像生成に失敗: ' + (e?.message || e));
+  } finally {
+    showProgress(false);
+  }
+}
+
+document.getElementById('camera').addEventListener('click', () => {
+  if (camPanel.classList.contains('hidden')) openCamera(); else closeCamera();
+});
+document.getElementById('camGenerate').addEventListener('click', generateFromCamera);
+document.getElementById('camClose').addEventListener('click', closeCamera);
+
+// アルバムから選択 — pick a photo from the library to use instead of the live
+// camera frame. The picked image replaces the feed in the panel; the camera is
+// released since it's no longer needed.
+document.getElementById('camAlbum').addEventListener('click', () => camFile.click());
+camFile.addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';   // allow re-picking the same file later
+  if (!f || !f.type.startsWith('image/')) { setStatus('画像ファイルではありません'); return; }
+  clearAlbum();
+  camAlbumUrl = URL.createObjectURL(f);
+  try {
+    camAlbumImage = await loadImage(camAlbumUrl);
+    camPhoto.src = camAlbumUrl;
+    camPanel.classList.add('album');
+    stopStream();   // using the album photo now; release the camera
+  } catch (err) {
+    setStatus('画像を読み込めません: ' + (err?.message || err));
+    clearAlbum();
+  }
+});
+
+document.getElementById('apikey').addEventListener('click', () => {
+  const cur = getApiKey();
+  const masked = cur ? cur.slice(0, 6) + '…' : '(未設定)';
+  const v = window.prompt(`Gemini APIキーを入力（Nano Banana 用）\n現在: ${masked}`, cur);
+  if (v !== null) {
+    localStorage.setItem('gemini_api_key', v.trim());
+    setStatus(v.trim() ? 'APIキーを保存しました' : 'APIキーを消去しました');
+  }
+});
+
+document.getElementById('reset').addEventListener('click', () => {
+  camera.position.set(0, 0, 2.4); controls.target.set(0, 0, 0); controls.update();
+});
+
+const dropEl = document.getElementById('drop');
+let dragDepth = 0;
+window.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; dropEl.classList.add('active'); });
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('dragleave', (e) => { e.preventDefault(); if (--dragDepth <= 0) dropEl.classList.remove('active'); });
+window.addEventListener('drop', (e) => {
+  e.preventDefault(); dragDepth = 0; dropEl.classList.remove('active');
+  if (e.dataTransfer.files[0]) loadFromFile(e.dataTransfer.files[0]);
+});
+window.addEventListener('paste', (e) => {
+  const item = [...(e.clipboardData?.items || [])].find(i => i.type.startsWith('image/'));
+  if (item) loadFromFile(item.getAsFile());
+});
+
+// ---------------------------------------------------------------------------
+// Render loop
+// ---------------------------------------------------------------------------
+function animate() {
+  requestAnimationFrame(animate);
+  if (params.autoRotate && mesh) mesh.rotation.y += 0.005;
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+setStatus('画像を読み込んでください（初回はAIモデルのDLに少し時間がかかります）');
+</script>
+</body>
+</html>

@@ -656,7 +656,13 @@ function carveAt(carves, u, v) {
     const val = sampleMap(m.data, m.w, m.h, u, v);
     const on = m.params.invert ? val < CARVE_MASK_THRESHOLD : val >= CARVE_MASK_THRESHOLD;
     if (!on) continue;
-    const f = c.edgePx > 1 ? Math.min(1, sampleRaw(c.dist, m.w, m.h, u, v) / c.edgePx) : 1;
+    // 境界(0)→内側(1)へのランプ。線形のままだと斜面が直線になり上下端に角が出る
+    // ので、smoothstep をかけて両端の接線を滑らかにし、断面を曲面(S字)にする。
+    let f = 1;
+    if (c.edgePx > 1) {
+      const t = Math.min(1, sampleRaw(c.dist, m.w, m.h, u, v) / c.edgePx);
+      f = t * t * (3 - 2 * t); // smoothstep
+    }
     sum += f * m.params.carve;
   }
   return sum;

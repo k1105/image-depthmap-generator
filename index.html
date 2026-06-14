@@ -169,6 +169,12 @@ camera.position.set(0, 0, 2.4);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
+// Stop the dolly before the camera punches into the model: when it does, the
+// near plane (0.01) slices the solid and you get a flat diagonal cut across the
+// translucent mold that looks like broken geometry. minDistance keeps the
+// camera outside; maxDistance avoids dollying past the far plane (100).
+controls.minDistance = 0.4;
+controls.maxDistance = 50;
 
 // Lights tuned so surface relief reads clearly even on an untextured mesh:
 // modest ambient + a strong raking key light from upper-left + a cool fill.
@@ -215,6 +221,12 @@ const params = {
   alphaThreshold: 0.5,  // below this the area is cut out (no depth, hidden)
   edgeCut: 0.04,        // width (fraction) of the band where depth ramps to 0
                         // at the silhouette, faking a clean cross-section cut
+  detilt: true,         // remove the global planar tilt that depth models add
+                        // even to flat top-down patterns (leaves, textures), so
+                        // the mold's top surface comes out level instead of a
+                        // diagonally-sloped wedge. Fits a least-squares plane to
+                        // the depth and subtracts it, keeping local relief.
+  detiltAmt: 1.0,       // 0 = off, 1 = remove the full fitted tilt
   smooth: 3.8,          // depth-map blur radius (px). The depth map is 8-bit
                         // (256 levels), so without this the relief shows
                         // staircase "terraces". Blurring into float dissolves
@@ -443,16 +455,54 @@ function boxBlurGray(src, w, h, radius) {
   return out;
 }
 
-// The depth buffer used for displacement: raw when smoothing is off, otherwise
-// a blurred float copy (cached per depth map + radius).
-let depthSmooth = null, depthSmoothKey = '';
+// Remove the global planar tilt from a depth field. Depth models bias even a
+// flat top-down image (a leaf pattern, a texture) with a large low-frequency
+// ramp, which turns the whole mold top into a diagonally-sloped wedge. We fit a
+// least-squares plane z = a*x + b*y + mean over the field and subtract a*x+b*y,
+// flattening the global slope while leaving the local relief untouched. Uses
+// centered, symmetric coords so Σx = Σy = Σxy = 0 and the slopes decouple.
+function detiltField(src, w, h, amt) {
+  const N = w * h;
+  let Sxx = 0, Syy = 0, Sxz = 0, Syz = 0;
+  for (let j = 0; j < h; j++) {
+    const y = h > 1 ? j / (h - 1) - 0.5 : 0;
+    for (let i = 0; i < w; i++) {
+      const x = w > 1 ? i / (w - 1) - 0.5 : 0;
+      const z = src[j * w + i];
+      Sxx += x * x; Syy += y * y; Sxz += x * z; Syz += y * z;
+    }
+  }
+  const a = Sxx > 0 ? amt * Sxz / Sxx : 0;
+  const b = Syy > 0 ? amt * Syz / Syy : 0;
+  const out = new Float32Array(N);
+  for (let j = 0; j < h; j++) {
+    const y = h > 1 ? j / (h - 1) - 0.5 : 0;
+    for (let i = 0; i < w; i++) {
+      const x = w > 1 ? i / (w - 1) - 0.5 : 0;
+      const k = j * w + i;
+      const v = src[k] - (a * x + b * y);   // subtracting a zero-mean plane keeps the mean
+      out[k] = v < 0 ? 0 : (v > 255 ? 255 : v);
+    }
+  }
+  return out;
+}
+
+// The depth buffer used for displacement: raw when no processing is needed,
+// otherwise a de-tilted and/or blurred float copy (cached per depth map +
+// settings). De-tilt runs before the blur so the smoothing operates on the
+// already-leveled field.
+let depthProc = null, depthProcKey = '';
 function getDepthField() {
-  if (!depthData || params.smooth <= 0) return depthData;
-  const key = `${depthVersion}@${params.smooth}`;
-  if (depthSmooth && depthSmoothKey === key) return depthSmooth;
-  depthSmooth = boxBlurGray(depthData, depthW, depthH, params.smooth);
-  depthSmoothKey = key;
-  return depthSmooth;
+  if (!depthData) return depthData;
+  const detilt = params.detilt && params.detiltAmt > 0;
+  const blur = params.smooth > 0;
+  if (!detilt && !blur) return depthData;
+  const key = `${depthVersion}@d${detilt ? params.detiltAmt : 0}@s${blur ? params.smooth : 0}`;
+  if (depthProc && depthProcKey === key) return depthProc;
+  let f = detilt ? detiltField(depthData, depthW, depthH, params.detiltAmt) : depthData;
+  if (blur) f = boxBlurGray(f, depthW, depthH, params.smooth);
+  depthProc = f; depthProcKey = key;
+  return depthProc;
 }
 
 // Chamfer distance transform: for each kept pixel, distance (in px) to the
@@ -926,37 +976,48 @@ function buildMoldTris() {
   const edgePx = Math.max(1, params.edgeCut * Math.min(alphaW, alphaH));
   const carves = activeCarves();
 
-  // Relief height in mm, computed with the SAME transfer as the relief preview
-  // (buildGeometry): disp = ((depth-0.5)*sign * edgeFactor) * depthScale, then
-  // mm = max(0, disp) * MOLD_MM_PER_UNIT. No maxRel normalisation, so the
-  // depth contrast and the depthScale multiplier behave exactly like the
-  // preview. keepG marks the subject area (where the offset recess applies).
+  // Relief height in mm, using the SAME transfer as the relief preview
+  // (buildGeometry): disp = ((depth-0.5)*sign - carve) * depthScale. The preview
+  // keeps the full signed range (relief goes both above and below the mid plane);
+  // a mold must sit on a floor, so instead of CLAMPING the far half to 0 (which
+  // flattens everything where depth < 0.5 into a plateau) we keep the full range
+  // and SHIFT it up so the lowest point rests on the floor (0). This preserves
+  // the complete relief, matching the preview's shape. keepG marks the subject
+  // area (where the offset recess applies); edgeF is the silhouette ramp, applied
+  // to the shifted height below so the cut drops cleanly to the floor.
   const sign = params.invertDepth ? -1 : 1;
   const depthField = getDepthField();
-  const relMM = new Float32Array(NX * NY);
+  const relMM = new Float32Array(NX * NY);   // signed height (mm), pre-shift
   const keepG = new Uint8Array(NX * NY);
-  let maxReliefMM = 0;
+  const edgeF = new Float32Array(NX * NY);    // silhouette ramp factor (1 = interior)
+  let minMM = Infinity, maxMM = -Infinity;
   for (let j = 0; j < NY; j++) {
     const Y = -H / 2 + (j / gy) * H;
     for (let i = 0; i < NX; i++) {
       const X = -W / 2 + (i / gx) * W;
-      let mm = 0, keep = 0;
+      let mm = 0, keep = 0, ef = 1;
       if (X >= rX0 && X <= rX0 + rW && Y >= rY0 && Y <= rY0 + rH) {
         const u = (X - rX0) / rW, v = (Y - rY0) / rH;
         if (!useA || sampleMap(alphaData, alphaW, alphaH, u, v) >= params.alphaThreshold) {
           keep = 1;
           let d = (sampleMap(depthField, depthW, depthH, u, v) - 0.5) * sign;
-          if (useA && edgePx > 1) d *= Math.min(1, sampleRaw(distField, alphaW, alphaH, u, v) / edgePx);
-          // Same carve masks (with the boundary ramp) as the relief preview,
-          // so the mold matches.
+          if (useA && edgePx > 1) ef = Math.min(1, sampleRaw(distField, alphaW, alphaH, u, v) / edgePx);
+          // Same carve masks (with the boundary ramp) as the relief preview.
           d -= carveAt(carves, u, v);
-          mm = Math.max(0, d * params.depthScale) * MOLD_MM_PER_UNIT;
+          mm = d * params.depthScale * MOLD_MM_PER_UNIT;   // full signed range, no clamp
+          if (mm < minMM) minMM = mm;
+          if (mm > maxMM) maxMM = mm;
         }
       }
-      relMM[j * NX + i] = mm; keepG[j * NX + i] = keep;
-      if (mm > maxReliefMM) maxReliefMM = mm;
+      const k = j * NX + i;
+      relMM[k] = mm; keepG[k] = keep; edgeF[k] = ef;
     }
   }
+  // Shift the whole field so the lowest kept point sits on the floor (0), then
+  // ramp the silhouette band down to the floor. Background cells stay at 0.
+  if (!isFinite(minMM)) { minMM = 0; maxMM = 0; }
+  for (let k = 0; k < NX * NY; k++) relMM[k] = keepG[k] ? (relMM[k] - minMM) * edgeF[k] : 0;
+  let maxReliefMM = maxMM - minMM;
 
   const Ztot = params.offsetMM + maxReliefMM + params.marginMM;
   const X = (i) => -W / 2 + (i / gx) * W;
@@ -1287,6 +1348,8 @@ const rebuild = () => { if (mesh) buildGeometry(); };
 const refresh = () => { rebuild(); applyMaterial(); };
 gui.add(params, 'depthScale', 0, 1.5, 0.01).name('立体の深さ (凹凸感)').onChange(() => { rebuild(); updateMoldPreview(); });
 gui.add(params, 'smooth', 0, 5, 0.1).name('深度なめらか (段差抑制)').onChange(() => { rebuild(); updateMoldPreview(); });
+gui.add(params, 'detilt').name('傾き補正 (全体の斜め除去)').onChange(() => { rebuild(); updateMoldPreview(); });
+gui.add(params, 'detiltAmt', 0, 1, 0.05).name('傾き補正の強さ').onChange(() => { rebuild(); updateMoldPreview(); });
 gui.add(params, 'invertDepth').name('奥行き反転').onChange(() => { rebuild(); updateMoldPreview(); });
 gui.add(params, 'showTexture').name('写真を貼る').onChange(applyMaterial);
 gui.add(params, 'wireframe').name('ワイヤーフレーム').onChange(applyMaterial);

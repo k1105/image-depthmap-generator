@@ -147,7 +147,6 @@
   <div id="bar">
     <button class="btn" id="camera">📷 写真から生成</button>
     <button class="btn" id="open">📂 画像を開く</button>
-    <button class="btn" id="reset">視点リセット</button>
     <button class="btn" id="apikey">🔑 APIキー</button>
     <div id="status">起動中…</div>
   </div>
@@ -188,6 +187,7 @@
     <button class="btn" id="vbModel">🧊 モデルプレビュー</button>
     <button class="btn" id="vbStl">🧱 STLプレビュー</button>
     <button class="btn" id="vbTexture">🖼 写真を貼る</button>
+    <button class="btn" id="reset">視点リセット</button>
   </div>
 
   <div id="progress"><div class="label"></div><div class="track"><div class="fill"></div></div></div>
@@ -776,6 +776,7 @@ function storeDepth(depth) {
   const buf = new Uint8Array(width * height);
   for (let i = 0; i < width * height; i++) buf[i] = data[i * channels]; // 1ch grayscale
   depthData = buf; depthW = width; depthH = height; depthVersion++;
+  setMapPreview(depthPreviewImg, buf, width, height);   // refresh the sidebar thumbnail
 }
 
 function loadImage(src) {
@@ -792,6 +793,7 @@ function loadImage(src) {
 // keeps its own on `mask.previewImg`. The elements are created during GUI setup.
 // ---------------------------------------------------------------------------
 let alphaPreviewImg = null;
+let depthPreviewImg = null;   // depth map's sidebar thumbnail
 // Render a grayscale buffer into a folder thumbnail (or hide it when cleared).
 function setMapPreview(img, buf, w, h) {
   if (!img) return;
@@ -981,7 +983,8 @@ async function processImage(url, name) {
   imageAspect = image.naturalWidth / image.naturalHeight || 1;
   alphaData = null; // invalidate previous mask until regenerated
   carveMasks.forEach(m => { m.data = null; m.distCache = null; }); // invalidate carve masks
-  setMapPreview(alphaPreviewImg, null);                       // clear stale thumbnails
+  setMapPreview(depthPreviewImg, null);                       // clear stale thumbnails
+  setMapPreview(alphaPreviewImg, null);
   carveMasks.forEach(m => setMapPreview(m.previewImg, null));
 
   if (colorTexture) colorTexture.dispose();
@@ -1019,6 +1022,7 @@ async function runMaskPipeline() {
     if (cachedDepth) {
       const g = await grayFromPngDataUrl(cachedDepth);
       depthData = g.buf; depthW = g.w; depthH = g.h; depthVersion++;
+      setMapPreview(depthPreviewImg, g.buf, g.w, g.h);   // refresh the sidebar thumbnail
       setStatus('深度をキャッシュから復元');
     } else {
       const estimator = await getEstimator();
@@ -1489,11 +1493,15 @@ gui.add(params, 'model', { '小・高速': 'small', '中': 'base', '大・高品
   });
 const rebuild = () => { if (mesh) buildGeometry(); };
 const refresh = () => { rebuild(); applyMaterial(); };
-gui.add(params, 'depthScale', 0, 1.5, 0.01).name('立体の深さ (凹凸感)').onChange(() => { rebuild(); updateMoldPreview(); });
-gui.add(params, 'smooth', 0, 5, 0.1).name('深度なめらか (段差抑制)').onChange(() => { rebuild(); updateMoldPreview(); });
-gui.add(params, 'detilt').name('傾き補正 (全体の斜め除去)').onChange(() => { rebuild(); updateMoldPreview(); });
-gui.add(params, 'detiltAmt', 0, 1, 0.05).name('傾き補正の強さ').onChange(() => { rebuild(); updateMoldPreview(); });
-gui.add(params, 'invertDepth').name('奥行き反転').onChange(() => { rebuild(); updateMoldPreview(); });
+// Depth map — preview thumbnail above its depth-shaping controls (same folder
+// pattern as the alpha / carve mask groups).
+const fDepth = gui.addFolder('深度マップ (Depth Anything)');
+depthPreviewImg = makeMapPreview(fDepth);
+fDepth.add(params, 'depthScale', 0, 1.5, 0.01).name('立体の深さ (凹凸感)').onChange(() => { rebuild(); updateMoldPreview(); });
+fDepth.add(params, 'smooth', 0, 5, 0.1).name('深度なめらか (段差抑制)').onChange(() => { rebuild(); updateMoldPreview(); });
+fDepth.add(params, 'detilt').name('傾き補正 (全体の斜め除去)').onChange(() => { rebuild(); updateMoldPreview(); });
+fDepth.add(params, 'detiltAmt', 0, 1, 0.05).name('傾き補正の強さ').onChange(() => { rebuild(); updateMoldPreview(); });
+fDepth.add(params, 'invertDepth').name('奥行き反転').onChange(() => { rebuild(); updateMoldPreview(); });
 // 写真を貼る / プレビュー切替 は画面下のビューバー (#viewbar) に独立配置。
 gui.add(params, 'wireframe').name('ワイヤーフレーム').onChange(applyMaterial);
 gui.add(params, 'segments', { '128': 128, '256': 256, '384': 384, '512': 512 })
